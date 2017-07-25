@@ -16,6 +16,7 @@
 package net.tascalate.concurrent;
 
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -51,8 +52,8 @@ class CompletableSubTask<T> extends AbstractCompletableTask<T> {
 
     }
 
-    CompletableSubTask(Executor executor) {
-        super(executor, new DelegatingCallable<T>());
+    CompletableSubTask(Executor executor, CompletionStage<?> dependency) {
+        super(executor, new DelegatingCallable<T>(), dependency);
     }
 
     @Override
@@ -64,6 +65,6 @@ class CompletableSubTask<T> extends AbstractCompletableTask<T> {
 
     @Override
     protected <U> AbstractCompletableTask<U> createCompletionStage(Executor executor) {
-        return new CompletableSubTask<U>(executor);
+        return new CompletableSubTask<U>(executor, this);
     }
 }

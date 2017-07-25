@@ -22,6 +22,7 @@
  */
 package net.tascalate.concurrent;
 
+import java.util.Arrays;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -52,11 +53,18 @@ abstract class AbstractCompletableTask<T> extends PromiseAdapter<T> implements P
     private final CallbackRegistry<T> callbackRegistry = new CallbackRegistry<>();
     protected final RunnableFuture<T> task;
     protected final Callable<T> action;
+    // Recursive cancellation support
+    private CompletionStage<?>[] dependencies = null;
+    private boolean dependenciesMightHaveBeenInterrupted = false;
+    private final Object dependenciesLock = new Object();
 
-    protected AbstractCompletableTask(Executor defaultExecutor, Callable<T> action) {
+    protected AbstractCompletableTask(Executor defaultExecutor, Callable<T> action, CompletionStage<?> dependency) {
         super(defaultExecutor);
         this.action = action;
         this.task = new StageTransition(action);
+        if (dependency != null) {
+            this.dependencies = new CompletionStage<?>[] { dependency };
+        }
     }
 
     abstract Runnable setupTransition(Callable<T> code);
@@ -64,6 +72,18 @@ abstract class AbstractCompletableTask<T> extends PromiseAdapter<T> implements P
     @Override
     public boolean cancel(boolean mayInterruptIfRunning) {
         if (task.cancel(mayInterruptIfRunning)) {
+            // Cancel dependencies if any, synchronization is needed due to
+            // possible async execution of fn in thenComposeAsync
+            synchronized (dependenciesLock) {
+                if (dependencies != null) {
+                    Arrays.stream(dependencies).forEach(d -> {
+                        CompletablePromise.cancelPromise(d, mayInterruptIfRunning);
+                    });
+                    // Keep value of mayInterruptIfRunning for the case when
+                    // a composite task is being executed during cancellation
+                    dependenciesMightHaveBeenInterrupted = mayInterruptIfRunning;
+                }
+            }
             onError(new CancellationException());
             return true;
         } else {
@@ -115,7 +135,11 @@ abstract class AbstractCompletableTask<T> extends PromiseAdapter<T> implements P
         @Override
         protected void set(T v) {
             super.set(v);
-            onSuccess(v);
+            if (!isCancelled()) {
+                onSuccess(v);
+            } else {
+                onError(new CancellationException());
+            }
         };
 
         @Override
@@ -147,7 +171,17 @@ abstract class AbstractCompletableTask<T> extends PromiseAdapter<T> implements P
                                               BiFunction<? super T, ? super U, ? extends V> fn, 
                                               Executor executor) {
 
-        return thenCompose(result1 -> other.thenApplyAsync(result2 -> fn.apply(result1, result2), executor));
+        AbstractCompletableTask<V> nextStage = doThenComposeAsync(
+                result1 -> other.thenApplyAsync(result2 -> fn.apply(result1, result2), executor),
+                SAME_THREAD_EXECUTOR);
+        
+        nextStage.whenComplete((r, e) -> {
+            if (nextStage.isCancelled()) {
+                CompletablePromise.cancelPromise(other, nextStage.dependenciesMightHaveBeenInterrupted);
+            }
+        });
+        
+        return nextStage;
     }
 
     @Override
@@ -200,32 +234,7 @@ abstract class AbstractCompletableTask<T> extends PromiseAdapter<T> implements P
 
     @Override
     public <U> Promise<U> thenComposeAsync(Function<? super T, ? extends CompletionStage<U>> fn, Executor executor) {
-
-        AbstractCompletableTask<U> nextStage = internalCreateCompletionStage(executor);
-        AbstractCompletableTask<Void> tempStage = internalCreateCompletionStage(executor);
-
-        // We must ALWAYS run through the execution
-        // of nextStage.task when this nextStage is
-        // exposed to the client, even in a "trivial" case:
-        // Success path, just return value
-        // Failure path, just re-throw exception
-        Executor helperExecutor = SAME_THREAD_EXECUTOR;
-        BiConsumer<? super U, ? super Throwable> moveToNextStage = (r, e) -> {
-            if (null == e)
-                runDirectly(nextStage, Function.identity(), r, helperExecutor);
-            else
-                runDirectly(nextStage, AbstractCompletableTask::forwardException, e, helperExecutor);
-        };
-
-        // Important -- tempStage is the target here
-        addCallbacks(
-            tempStage, 
-            consumerAsFunction(r -> fn.apply(r).whenComplete(moveToNextStage)), 
-            e -> { moveToNextStage.accept(null, e); return null; }, /* must-have if fn.apply above failed */
-            executor
-        );
-
-        return nextStage;
+        return doThenComposeAsync(fn, executor);
     }
 
     @Override
@@ -323,10 +332,54 @@ abstract class AbstractCompletableTask<T> extends PromiseAdapter<T> implements P
         // the other one is ignored
         first.whenComplete(action);
         second.whenComplete(action);
+        
+        // Next stage is not exposed to the client, no need to synchronize
+        nextStage.dependencies = new CompletionStage<?>[] { this, first, second };
 
         return nextStage.thenApplyAsync(fn, executor);
     }
 
+    private <U> AbstractCompletableTask<U> doThenComposeAsync(Function<? super T, ? extends CompletionStage<U>> fn, Executor executor) {
+        
+        AbstractCompletableTask<U> nextStage = internalCreateCompletionStage(executor);
+        AbstractCompletableTask<Void> tempStage = internalCreateCompletionStage(executor);
+
+        // We must ALWAYS run through the execution
+        // of nextStage.task when this nextStage is
+        // exposed to the client, even in a "trivial" case:
+        // Success path, just return value
+        // Failure path, just re-throw exception
+        Executor helperExecutor = SAME_THREAD_EXECUTOR;
+        BiConsumer<? super U, ? super Throwable> moveToNextStage = (r, e) -> {
+            if (null == e)
+                runDirectly(nextStage, Function.identity(), r, helperExecutor);
+            else
+                runDirectly(nextStage, AbstractCompletableTask::forwardException, e, helperExecutor);
+        };
+
+        // Important -- tempStage is the target here
+        addCallbacks(
+            tempStage, 
+            consumerAsFunction(r -> {
+                // Apply might take LONG time to run
+                CompletionStage<?> cs = fn.apply(r).whenComplete(moveToNextStage);
+                // Next stage is exposed to the client, synchronization needed
+                synchronized (nextStage.dependenciesLock) {
+                    if (!nextStage.isCancelled()) {
+                        nextStage.dependencies = new CompletionStage<?>[] { cs };
+                    } else {
+                        // Next stage might have been cancelled before fn.apply(r) finished
+                        CompletablePromise.cancelPromise(cs, nextStage.dependenciesMightHaveBeenInterrupted);
+                    }
+                }
+            }), 
+            e -> { moveToNextStage.accept(null, e); return null; }, /* must-have if fn.apply above failed */
+            executor
+        );
+
+        return nextStage;
+    }
+    
     private <U> AbstractCompletableTask<U> internalCreateCompletionStage(Executor executor) {
         // Preserve default async executor, or use user-supplied executor as default
         // But don't let SAME_THREAD_EXECUTOR to be a default async executor

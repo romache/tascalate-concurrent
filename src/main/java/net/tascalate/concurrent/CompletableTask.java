@@ -39,7 +39,7 @@ public class CompletableTask<T> extends AbstractCompletableTask<T> implements Ru
      *   a {@link Callable} that completes this task
      */
     protected CompletableTask(Executor executor, Callable<T> callable) {
-        super(executor, callable);
+        super(executor, callable, null);
     }
 
     /**
@@ -156,6 +156,6 @@ public class CompletableTask<T> extends AbstractCompletableTask<T> implements Ru
      */
     @Override
     protected <U> AbstractCompletableTask<U> createCompletionStage(Executor executor) {
-        return new CompletableSubTask<U>(executor);
+        return new CompletableSubTask<U>(executor, this);
     }
 }
